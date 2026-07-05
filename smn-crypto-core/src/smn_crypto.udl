@@ -1,0 +1,62 @@
+namespace smn_crypto {};
+
+// --- Ошибки, пробрасываемые в Kotlin как исключения ---
+[Error]
+enum SmnCryptoError {
+    "InvalidKeyLength",
+    "DecryptionFailed",
+    "SignatureInvalid",
+    "HandshakeFailed",
+};
+
+// --- Эфемерная X25519-пара под одну сессию/ротацию ---
+dictionary EphemeralKeyPair {
+    bytes public_key;   // 32 байта, отправляется соседу открытым текстом
+    u64 opaque_handle;  // приватная часть остаётся в Rust-памяти, наружу не отдаём
+};
+
+// --- Долгоживущая identity (Ed25519) ---
+dictionary LongTermIdentity {
+    bytes signing_public_key;
+    u64 opaque_handle;
+};
+
+// --- Подписанное сообщение об обновлении ключа для DHT ---
+dictionary SignedKeyUpdate {
+    string master_id;
+    bytes new_encryption_public_key;
+    u64 timestamp;
+    bytes signature;
+};
+
+interface SmnCryptoEngine {
+    constructor();
+
+    // Идентичность
+    LongTermIdentity generate_identity();
+    string derive_master_id(bytes signing_public_key);
+
+    // PFS handshake
+    [Throws=SmnCryptoError]
+    EphemeralKeyPair generate_ephemeral_keys();
+
+    [Throws=SmnCryptoError]
+    bytes compute_session_key(u64 my_ephemeral_handle, bytes neighbor_ephemeral_public);
+
+    // Явное зануление — вызывать сразу после ротации, не после disconnect
+    void wipe_ephemeral(u64 handle);
+    void wipe_identity(u64 handle);
+
+    // Key-update подпись/проверка (защита от угона Master-ID)
+    [Throws=SmnCryptoError]
+    SignedKeyUpdate sign_key_update(u64 identity_handle, bytes new_encryption_public_key, u64 timestamp);
+
+    boolean verify_key_update(SignedKeyUpdate update, bytes known_signing_public_key);
+
+    // AEAD-шифрование пакета сессионным ключом
+    [Throws=SmnCryptoError]
+    bytes encrypt_packet(bytes session_key, bytes plaintext, bytes associated_data);
+
+    [Throws=SmnCryptoError]
+    bytes decrypt_packet(bytes session_key, bytes ciphertext, bytes associated_data);
+};
