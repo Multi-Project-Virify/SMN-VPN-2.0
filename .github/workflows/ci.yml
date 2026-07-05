@@ -18,25 +18,37 @@ jobs:
 
       - name: Установить Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Кэш зависимостей
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: smn-crypto-core
 
-      # На раннем этапе разработки держим только базовую проверку компиляции —
-      # fmt/clippy как строгие блокеры добавим позже, когда код стабилизируется,
-      # иначе CI будет падать на стиле, а не на реальных ошибках.
+      # ИЗМЕНЕНО: continue-on-error убран. Зелёная галочка на сломанном
+      # крипто-коде хуже, чем отсутствие CI вообще — она создаёт ложное
+      # чувство безопасности у ревьюеров. Это блокеры теперь, не рекомендации.
       - name: cargo check
         run: cargo check --all-features
-        continue-on-error: true
 
       - name: cargo test
         run: cargo test --all-features
-        continue-on-error: true
 
-  # Отдельный джоб: не даём смержить PR, если кто-то случайно
-  # закоммитил приватный ключ/секрет в репозиторий
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-features -- -D warnings
+
+      - name: Установить cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Проверка известных CVE в зависимостях (x25519-dalek, chacha20poly1305
+      # и т.д.) на каждый PR — раньше отсутствовала полностью.
+      - name: cargo audit
+        run: cargo audit
+
   secret-scan:
     name: Проверка на утечку секретов
     runs-on: ubuntu-latest
