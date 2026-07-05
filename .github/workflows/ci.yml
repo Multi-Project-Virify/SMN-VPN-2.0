@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  rust-check:
+    name: Проверка smn-crypto-core (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: smn-crypto-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кэш зависимостей
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: smn-crypto-core
+
+      - name: cargo check
+        run: cargo check --all-features
+
+      - name: cargo test
+        run: cargo test --all-features
+
+      - name: cargo clippy (линт, ловит небезопасные паттерны)
+        run: cargo clippy -- -D warnings
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  # Отдельный джоб: не даём смержить PR, если кто-то случайно
+  # закоммитил приватный ключ/секрет в репозиторий
+  secret-scan:
+    name: Проверка на утечку секретов
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
