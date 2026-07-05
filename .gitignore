@@ -1,0 +1,31 @@
+# --- Android / Kotlin ---
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# --- Rust ---
+target/
+Cargo.lock
+**/*.rs.bk
+
+# --- UniFFI generated bindings (регенерируются сборкой, не коммитим) ---
+app/generated/
+
+# --- Секреты, никогда не коммитим ---
+*.jks
+*.keystore
+*.pem
+*.gpg
+keystore.properties
+**/secrets.*
+
+# --- OS ---
+.DS_Store
+Thumbs.db
