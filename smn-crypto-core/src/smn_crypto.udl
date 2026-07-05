@@ -1,27 +1,25 @@
 namespace smn_crypto {};
 
-// --- Ошибки, пробрасываемые в Kotlin как исключения ---
 [Error]
 enum SmnCryptoError {
     "InvalidKeyLength",
     "DecryptionFailed",
     "SignatureInvalid",
     "HandshakeFailed",
+    "StaleKeyUpdate",
+    "ReplayedPacket",
 };
 
-// --- Эфемерная X25519-пара под одну сессию/ротацию ---
 dictionary EphemeralKeyPair {
-    bytes public_key;   // 32 байта, отправляется соседу открытым текстом
-    u64 opaque_handle;  // приватная часть остаётся в Rust-памяти, наружу не отдаём
+    bytes public_key;
+    u64 opaque_handle;
 };
 
-// --- Долгоживущая identity (Ed25519) ---
 dictionary LongTermIdentity {
     bytes signing_public_key;
     u64 opaque_handle;
 };
 
-// --- Подписанное сообщение об обновлении ключа для DHT ---
 dictionary SignedKeyUpdate {
     string master_id;
     bytes new_encryption_public_key;
@@ -32,31 +30,34 @@ dictionary SignedKeyUpdate {
 interface SmnCryptoEngine {
     constructor();
 
-    // Идентичность
     LongTermIdentity generate_identity();
     string derive_master_id(bytes signing_public_key);
 
-    // PFS handshake
     [Throws=SmnCryptoError]
     EphemeralKeyPair generate_ephemeral_keys();
 
     [Throws=SmnCryptoError]
     bytes compute_session_key(u64 my_ephemeral_handle, bytes neighbor_ephemeral_public);
 
-    // Явное зануление — вызывать сразу после ротации, не после disconnect
     void wipe_ephemeral(u64 handle);
     void wipe_identity(u64 handle);
 
-    // Key-update подпись/проверка (защита от угона Master-ID)
     [Throws=SmnCryptoError]
     SignedKeyUpdate sign_key_update(u64 identity_handle, bytes new_encryption_public_key, u64 timestamp);
 
+    // Теперь также проверяет monotonic timestamp (anti-replay) — состояние
+    // хранится внутри engine, поэтому один и тот же экземпляр SmnCryptoEngine
+    // должен переиспользоваться между вызовами, а не пересоздаваться.
     boolean verify_key_update(SignedKeyUpdate update, bytes known_signing_public_key);
 
-    // AEAD-шифрование пакета сессионным ключом
+    // ИЗМЕНЕНО: добавлен packet_counter — обязателен для anti-replay защиты.
+    // Вызывающая сторона (транспортный слой) обязана инкрементировать его
+    // строго монотонно для каждой сессии.
     [Throws=SmnCryptoError]
-    bytes encrypt_packet(bytes session_key, bytes plaintext, bytes associated_data);
+    bytes encrypt_packet(bytes session_key, bytes plaintext, bytes associated_data, u64 packet_counter);
 
+    // ИЗМЕНЕНО: добавлен session_id — стабильный идентификатор сессии
+    // (не секрет), нужен engine'у для хранения anti-replay состояния счётчика.
     [Throws=SmnCryptoError]
-    bytes decrypt_packet(bytes session_key, bytes ciphertext, bytes associated_data);
+    bytes decrypt_packet(string session_id, bytes session_key, bytes ciphertext, bytes associated_data);
 };
