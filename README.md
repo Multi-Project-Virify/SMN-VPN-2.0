@@ -59,3 +59,4 @@ uniffi-bindgen generate src/smn_crypto.udl --language kotlin --out-dir ../app/ge
 ## License
 
 Apache License 2.0 — см. `LICENSE`.
+ссылка на репозиторий — https://github.com/Multi-Project-Virify/SMN-VPN-2.0
