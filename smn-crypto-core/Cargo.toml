@@ -1,0 +1,35 @@
+[package]
+name = "smn-crypto-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "smn_crypto_core"
+
+[dependencies]
+# X25519 ECDH — эфемерные ключи для PFS
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# Ed25519 — долгоживущий подписывающий ключ (Master-ID / key-update)
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# XChaCha20-Poly1305 AEAD — единственный шифр, без AES-опции (решили раньше)
+chacha20poly1305 = { version = "0.10" }
+# HKDF-SHA256 поверх сырого ECDH-выхода
+hkdf = "0.12"
+sha2 = "0.10"
+# Гарантированное зануление секретов из памяти — то, чего JVM/Kotlin дать не может
+zeroize = { version = "1.7", features = ["derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+# UniFFI — автогенерация Kotlin-байндингов без ручного JNI
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror = "1.0"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[profile.release]
+# Не даём компилятору "оптимизировать" zeroize-вызовы в no-op
+lto = true
+panic = "abort"
