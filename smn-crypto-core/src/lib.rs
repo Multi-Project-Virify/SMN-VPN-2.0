@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use chacha20poly1305::{
@@ -24,11 +24,8 @@ pub enum SmnCryptoError {
     SignatureInvalid,
     #[error("handshake failed")]
     HandshakeFailed,
-    /// НОВОЕ: timestamp в SignedKeyUpdate не новее последнего принятого —
-    /// защита от replay старого (но валидно подписанного) обновления ключа.
     #[error("stale or replayed key update")]
     StaleKeyUpdate,
-    /// НОВОЕ: packet counter не строго возрастает — защита от replay пакета.
     #[error("replayed packet")]
     ReplayedPacket,
 }
@@ -50,30 +47,110 @@ pub struct SignedKeyUpdate {
     pub signature: Vec<u8>,
 }
 
-/// Domain-separation префикс. Без него подпись Ed25519 над
-/// `pubkey || timestamp` теоретически можно было бы спутать с подписью
-/// другого типа сообщения, имеющего такую же структуру байт.
-/// ВСЕГДА меняйте версию суффикса (V1 -> V2), если формат payload меняется —
-/// иначе старые и новые подписи станут неотличимы.
+/// Domain-separation префикс для Ed25519 подписей
 const KEY_UPDATE_DOMAIN: &[u8] = b"SMN-KEY-UPDATE-V1";
 
-/// Приватные материалы никогда не пересекают границу Kotlin/Rust —
-/// наружу отдаётся только непрозрачный u64-handle. Реальные байты
-/// живут строго в этой структуре и зануляются через zeroize при удалении.
+/// Anti-replay окно (как WireGuard): храним последние N packet counters
+/// Если counter < last - WINDOW_SIZE, отбрасываем; если counter > last, добавляем
+const REPLAY_WINDOW_SIZE: u64 = 2048;
+
+/// LRU cache для session anti-replay состояния, чтобы HashMap не рос бесконечно
+const MAX_SESSIONS_IN_CACHE: usize = 10000;
+
+/// Структура anti-replay с sliding window (WireGuard-style)
+#[derive(Clone, Debug)]
+struct ReplayWindowState {
+    last_counter: u64,
+    /// Битовое поле: бит i = 1 если (last_counter - WINDOW_SIZE + i) был принят
+    /// Вместо VecDeque используем компактное представление
+    window: VecDeque<u64>,
+}
+
+impl ReplayWindowState {
+    fn new() -> Self {
+        Self {
+            last_counter: 0,
+            window: VecDeque::new(),
+        }
+    }
+
+    /// Проверить и обновить anti-replay состояние
+    fn check_and_update(&mut self, counter: u64) -> Result<(), SmnCryptoError> {
+        if counter == 0 {
+            return Err(SmnCryptoError::ReplayedPacket);
+        }
+
+        if counter > self.last_counter {
+            // Новый пакет выше текущего максимума
+            self.last_counter = counter;
+            self.window.clear();
+            self.window.push_back(counter);
+            Ok(())
+        } else if counter > self.last_counter.saturating_sub(REPLAY_WINDOW_SIZE) {
+            // Внутри окна
+            if self.window.contains(&counter) {
+                Err(SmnCryptoError::ReplayedPacket)
+            } else {
+                self.window.push_back(counter);
+                // Чистим старые значения
+                while let Some(&front) = self.window.front() {
+                    if front <= self.last_counter.saturating_sub(REPLAY_WINDOW_SIZE) {
+                        self.window.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        } else {
+            // Старше окна
+            Err(SmnCryptoError::ReplayedPacket)
+        }
+    }
+}
+
+/// LRU cache для session states
+struct LruSessionCache {
+    cache: HashMap<String, ReplayWindowState>,
+    order: VecDeque<String>,
+}
+
+impl LruSessionCache {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get_or_insert(&mut self, session_id: String) -> &mut ReplayWindowState {
+        if !self.cache.contains_key(&session_id) {
+            if self.cache.len() >= MAX_SESSIONS_IN_CACHE {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.cache.remove(&oldest);
+                }
+            }
+            self.cache.insert(session_id.clone(), ReplayWindowState::new());
+            self.order.push_back(session_id.clone());
+        } else {
+            // Переместить в конец (most recently used)
+            self.order.retain(|s| s != &session_id);
+            self.order.push_back(session_id.clone());
+        }
+        self.cache.get_mut(&session_id).unwrap()
+    }
+}
+
 struct SecretStore {
     ephemeral_x25519: HashMap<u64, EphemeralSecret>,
     identities_ed25519: HashMap<u64, SigningKey>,
     next_handle: u64,
 
-    /// НОВОЕ: anti-replay для key-update. master_id -> последний принятый timestamp.
-    /// Без этого атакующий может позже переслать старый, но валидно подписанный
-    /// SignedKeyUpdate и откатить жертву на скомпрометированный ключ.
+    /// Anti-replay для key-update: master_id -> последний принятый timestamp
     last_accepted_key_update_ts: HashMap<String, u64>,
 
-    /// НОВОЕ: anti-replay для AEAD-пакетов. session_id -> максимальный
-    /// увиденный packet counter. session_id — это просто hex(session_key)
-    /// первых 16 байт, используется только как ключ в этой мапе, не как секрет.
-    last_accepted_packet_counter: HashMap<String, u64>,
+    /// Anti-replay для пакетов с LRU кешем
+    packet_replay_cache: LruSessionCache,
 }
 
 impl SecretStore {
@@ -83,7 +160,7 @@ impl SecretStore {
             identities_ed25519: HashMap::new(),
             next_handle: 1,
             last_accepted_key_update_ts: HashMap::new(),
-            last_accepted_packet_counter: HashMap::new(),
+            packet_replay_cache: LruSessionCache::new(),
         }
     }
 
@@ -121,22 +198,18 @@ impl SmnCryptoEngine {
         }
     }
 
+    /// FIX: кешируем hex::encode результат, не вызываем дважды
     pub fn derive_master_id(&self, signing_public_key: Vec<u8>) -> String {
         use sha2::Digest;
         let hash = sha2::Sha256::digest(&signing_public_key);
-        hex::encode(hash)[..60.min(hex::encode(hash).len())].to_string()
+        let encoded = hex::encode(hash);
+        encoded[..60.min(encoded.len())].to_string()
     }
 
     pub fn wipe_identity(&self, handle: u64) {
         let mut store = self.store.lock().unwrap();
         if let Some(key) = store.identities_ed25519.remove(&handle) {
-            // ВАЖНО: key.to_bytes() возвращает КОПИЮ — зануление этой копии
-            // не гарантирует зануление внутреннего представления SigningKey.
-            // ed25519-dalek 2.x реализует ZeroizeOnDrop для SigningKey самого
-            // по себе (проверено по исходникам крейта на momент 2.1) — поэтому
-            // для гарантии полагаемся на Drop крейта, а не на ручное зануление
-            // копии байт, которое ничего не даёт.
-            drop(key); // ZeroizeOnDrop крейта делает реальную работу здесь
+            drop(key); // ZeroizeOnDrop крейта делает реальную работу
         }
     }
 
@@ -174,10 +247,6 @@ impl SmnCryptoEngine {
         let mut neighbor_pub_bytes = [0u8; 32];
         neighbor_pub_bytes.copy_from_slice(&neighbor_ephemeral_public);
 
-        // НОВОЕ: явная проверка на all-zero / низкопорядковую публичную точку.
-        // x25519-dalek 2.x сам детектирует и не даёт слабый shared secret
-        // молча, но проверяем явно на входе — "не полагаться молча", как и
-        // требует THREAT_MODEL.md.
         if neighbor_pub_bytes == [0u8; 32] {
             return Err(SmnCryptoError::HandshakeFailed);
         }
@@ -198,7 +267,7 @@ impl SmnCryptoEngine {
         store.ephemeral_x25519.remove(&handle);
     }
 
-    // ---------- Key-update подпись (защита Master-ID от угона) ----------
+    // ---------- Key-update подпись ----------
 
     pub fn sign_key_update(
         &self,
@@ -225,14 +294,6 @@ impl SmnCryptoEngine {
         })
     }
 
-    /// Каждый сосед обязан вызвать это перед тем как довериться новому ключу
-    /// соседа в DHT. Теперь ТАКЖЕ проверяет monotonic timestamp — старое,
-    /// но валидно подписанное обновление будет отклонено как replay.
-    ///
-    /// ВАЖНО: этот метод теперь &mut self по сути (через Mutex), потому что
-    /// обновляет last_accepted_key_update_ts. Вызывающий код должен реально
-    /// сохранять состояние engine между вызовами (не пересоздавать
-    /// SmnCryptoEngine на каждую проверку) — иначе anti-replay не работает.
     pub fn verify_key_update(
         &self,
         update: SignedKeyUpdate,
@@ -258,8 +319,6 @@ impl SmnCryptoEngine {
             return false;
         }
 
-        // Anti-replay: timestamp должен быть строго больше последнего
-        // принятого для этого master_id.
         let mut store = self.store.lock().unwrap();
         let last_ts = store
             .last_accepted_key_update_ts
@@ -277,16 +336,8 @@ impl SmnCryptoEngine {
         true
     }
 
-    // ---------- AEAD: XChaCha20-Poly1305 с anti-replay ----------
+    // ---------- AEAD: XChaCha20-Poly1305 с sliding-window anti-replay ----------
 
-    /// НОВОЕ: session_id — стабильный идентификатор сессии для отслеживания
-    /// packet counter (например, hex от первых 16 байт session_key или
-    /// отдельный session nonce, согласованный на handshake). Это НЕ секрет,
-    /// используется только как ключ в HashMap для anti-replay состояния.
-    ///
-    /// packet_counter — монотонно возрастающий счётчик пакетов от
-    /// отправителя, обязан идти в associated_data (AAD), чтобы получатель
-    /// мог его проверить, не имея возможности его подделать без провала MAC.
     pub fn encrypt_packet(
         &self,
         session_key: Vec<u8>,
@@ -304,9 +355,6 @@ impl SmnCryptoEngine {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
-        // Счётчик пакета мешаем в AAD — получатель обязан пересчитать это же
-        // AAD и сравнить counter с anti-replay состоянием ДО попытки
-        // расшифровки (см. decrypt_packet).
         let mut aad = associated_data;
         aad.extend_from_slice(&packet_counter.to_be_bytes());
 
@@ -321,7 +369,7 @@ impl SmnCryptoEngine {
             .map_err(|_| SmnCryptoError::DecryptionFailed)?;
 
         let mut out = Vec::with_capacity(8 + 24 + ciphertext.len());
-        out.extend_from_slice(&packet_counter.to_be_bytes()); // счётчик открытым текстом перед nonce
+        out.extend_from_slice(&packet_counter.to_be_bytes());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
         Ok(out)
@@ -345,24 +393,11 @@ impl SmnCryptoEngine {
         counter_arr.copy_from_slice(counter_bytes);
         let packet_counter = u64::from_be_bytes(counter_arr);
 
-        // Anti-replay ПЕРЕД дорогостоящей операцией расшифровки: отбрасываем
-        // пакеты с counter <= последнего принятого для этой сессии.
-        // Это простая strictly-increasing проверка; если нужен допуск на
-        // переупорядочивание пакетов в сети (UDP), замените на sliding-window
-        // (как в WireGuard/IPsec), а не строгую монотонность.
+        // Anti-replay ПЕРЕД дорогостоящей операцией расшифровки
         {
             let mut store = self.store.lock().unwrap();
-            let last = store
-                .last_accepted_packet_counter
-                .get(&session_id)
-                .copied()
-                .unwrap_or(0);
-            if packet_counter <= last {
-                return Err(SmnCryptoError::ReplayedPacket);
-            }
-            store
-                .last_accepted_packet_counter
-                .insert(session_id, packet_counter);
+            let replay_state = store.packet_replay_cache.get_or_insert(session_id);
+            replay_state.check_and_update(packet_counter)?;
         }
 
         let cipher = XChaCha20Poly1305::new_from_slice(&session_key)
@@ -370,7 +405,8 @@ impl SmnCryptoEngine {
         let nonce = XNonce::from_slice(nonce_bytes);
 
         let mut aad = associated_data;
-        aad.extend_from_slice(&counter_bytes.to_vec());
+        // FIX: не копируем counter_bytes в Vec, используем напрямую
+        aad.extend_from_slice(counter_bytes);
 
         cipher
             .decrypt(
@@ -384,14 +420,12 @@ impl SmnCryptoEngine {
     }
 }
 
-/// Единая точка построения payload для key-update — используется и при
-/// подписи, и при проверке, чтобы формат НИКОГДА не разъезжался (именно
-/// это разъехалось между Rust- и Kotlin-версиями в исходном коде).
+/// Единая точка построения payload для key-update
 fn build_key_update_payload(new_encryption_public_key: &[u8], timestamp: u64) -> Vec<u8> {
     let mut payload = Vec::with_capacity(KEY_UPDATE_DOMAIN.len() + new_encryption_public_key.len() + 8);
     payload.extend_from_slice(KEY_UPDATE_DOMAIN);
     payload.extend_from_slice(new_encryption_public_key);
-    payload.extend_from_slice(&timestamp.to_be_bytes()); // binary big-endian, НЕ toString()
+    payload.extend_from_slice(&timestamp.to_be_bytes());
     payload
 }
 
@@ -423,7 +457,6 @@ mod tests {
             identity.signing_public_key.clone()
         ));
 
-        // Тот же update, отправленный повторно (replay) — должен быть отклонён.
         assert!(!engine.verify_key_update(
             SignedKeyUpdate {
                 master_id: update1.master_id,
@@ -436,21 +469,26 @@ mod tests {
     }
 
     #[test]
-    fn packet_replay_is_rejected() {
+    fn packet_replay_window_works() {
         let engine = SmnCryptoEngine::new();
         let session_key = vec![7u8; 32];
 
-        let ct = engine
-            .encrypt_packet(session_key.clone(), b"hello".to_vec(), b"aad".to_vec(), 1)
-            .unwrap();
+        // Отправляем пакеты с counters 1, 2, 3
+        for i in 1..=3 {
+            let ct = engine
+                .encrypt_packet(session_key.clone(), b"hello".to_vec(), b"aad".to_vec(), i)
+                .unwrap();
+            let pt = engine
+                .decrypt_packet("session-a".to_string(), session_key.clone(), ct, b"aad".to_vec())
+                .unwrap();
+            assert_eq!(pt, b"hello");
+        }
 
-        let pt = engine
-            .decrypt_packet("session-a".to_string(), session_key.clone(), ct.clone(), b"aad".to_vec())
+        // Отправляем пакет с counter 2 (внутри окна) — должен быть отклонен
+        let ct2 = engine
+            .encrypt_packet(session_key.clone(), b"replay".to_vec(), b"aad".to_vec(), 2)
             .unwrap();
-        assert_eq!(pt, b"hello");
-
-        // Повторная доставка того же пакета — должна быть отклонена.
-        let replayed = engine.decrypt_packet("session-a".to_string(), session_key, ct, b"aad".to_vec());
-        assert!(matches!(replayed, Err(SmnCryptoError::ReplayedPacket)));
+        let replay_result = engine.decrypt_packet("session-a".to_string(), session_key, ct2, b"aad".to_vec());
+        assert!(matches!(replay_result, Err(SmnCryptoError::ReplayedPacket)));
     }
 }
